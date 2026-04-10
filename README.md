@@ -7,6 +7,8 @@
 > 这是我的issue： https://github.com/DingTalk-Real-AI/dingtalk-openclaw-connector/issues/456
 >
 > [于是有了这个玩具。](https://clawhub.ai/shyzhen/dingtalk-send-media)
+>
+> 可以使用`openclaw skills install dingtalk-send-media`命令安装，也可以自己下载放到skills目录下。
 
 ---
 

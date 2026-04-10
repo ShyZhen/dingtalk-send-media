@@ -21,6 +21,14 @@ import uuid
 from pathlib import Path
 
 
+def has_direct_env_credentials():
+    """是否直接提供了钉钉凭证环境变量"""
+    return bool(
+        os.environ.get('DINGTALK_CLIENTID', '') and
+        os.environ.get('DINGTALK_CLIENTSECRET', '')
+    )
+
+
 def get_home_dir():
     """获取用户主目录"""
     if os.name == 'nt':
@@ -47,7 +55,9 @@ def load_openclaw_config():
     """加载 OpenClaw 配置文件"""
     config_path = get_config_path()
     if not config_path:
-        raise FileNotFoundError("未找到 OpenClaw 配置文件 openclaw.json")
+        if has_direct_env_credentials():
+            return {}
+        raise FileNotFoundError("未找到 OpenClaw 配置文件 openclaw.json，且未设置 DINGTALK_CLIENTID / DINGTALK_CLIENTSECRET")
     
     with open(config_path, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -86,6 +96,10 @@ def detect_account_from_agent_id(openclaw_config, agent_id=None, account_id=None
     if env_account:
         return env_account, 'OPENCLAW_ACCOUNT_ID'
 
+    # 优先级 2.5: 直接环境变量凭证
+    if has_direct_env_credentials():
+        return '__env__', 'direct_env_credentials'
+
     # 优先级 3: 从会话上下文传入的账号（direct runtime 模式）
     if channel_account:
         return channel_account, 'channel_context'
@@ -101,7 +115,7 @@ def detect_account_from_agent_id(openclaw_config, agent_id=None, account_id=None
         for binding in bindings:
             if binding.get('agentId') == agent_id:
                 match = binding.get('match', {})
-                if match.get('channel') == 'dingtalk':
+                if match.get('channel') in ('dingtalk', 'dingtalk-connector'):
                     account_id = match.get('accountId')
                     if account_id:
                         return account_id, f'binding:{agent_id}→{account_id}'
@@ -117,13 +131,32 @@ def detect_account_from_agent_id(openclaw_config, agent_id=None, account_id=None
     if default_account:
         return default_account, 'defaultAccount_config'
 
-    # 优先级 6: 自动检测 dingtalk-connector 配置（新增）
+    connector = channels.get('dingtalk-connector', {})
+    connector_default_account = connector.get('defaultAccount')
+    if connector_default_account:
+        return connector_default_account, 'dingtalk_connector.defaultAccount'
+
+    # 优先级 6: 自动检测 dingtalk-connector.accounts 配置
+    connector_accounts = connector.get('accounts', {})
+    if connector_accounts:
+        connector_account_keys = list(connector_accounts.keys())
+        if len(connector_account_keys) == 1:
+            return connector_account_keys[0], 'single_connector_account_auto'
+        raise ValueError(
+            f"检测到多个 dingtalk-connector 账号配置：{', '.join(connector_account_keys)}，"
+            f"请通过以下方式之一指定使用哪个账号：\n"
+            f"  1. 设置 OPENCLAW_ACCOUNT_ID 环境变量\n"
+            f"  2. 配置 bindings 映射\n"
+            f"  3. 在命令行显式指定账号参数"
+        )
+
+    # 优先级 7: 自动检测 dingtalk-connector 顶层配置
     dingtalk_connector = channels.get('dingtalk-connector', {})
-    if dingtalk_connector.get('enabled', False) and dingtalk_connector.get('clientId'):
+    if dingtalk_connector.get('clientId'):
         # 使用 connector 配置，账号 ID 固定为 'connector'
         return 'connector', 'dingtalk-connector'
 
-    # 优先级 7: 自动检测 dingtalk.accounts 配置
+    # 优先级 8: 自动检测 dingtalk.accounts 配置
     accounts = dingtalk.get('accounts', {})
     if accounts:
         account_keys = list(accounts.keys())
@@ -139,6 +172,9 @@ def detect_account_from_agent_id(openclaw_config, agent_id=None, account_id=None
                 f"  2. 配置 bindings 映射\n"
                 f"  3. 在命令行显式指定账号参数"
             )
+
+    if has_direct_env_credentials():
+        return '__env__', 'direct_env_credentials'
 
     # 没有任何钉钉账号配置，报错
     raise ValueError(
@@ -183,11 +219,22 @@ def get_dingtalk_config(openclaw_config, account_id='prd_bot'):
 
     # 优先级 2 & 3：从配置文件获取
 
+    # 纯环境变量模式
+    if account_id == '__env__':
+        if not env_client_id or not env_client_secret:
+            raise ValueError("环境变量模式下缺少 DINGTALK_CLIENTID 或 DINGTALK_CLIENTSECRET")
+        env_robot_code = os.environ.get('DINGTALK_ROBOTCODE', env_client_id)
+        return {
+            'clientId': env_client_id,
+            'clientSecret': env_client_secret,
+            'robotCode': env_robot_code,
+            'corpId': os.environ.get('DINGTALK_CORPID', ''),
+            'agentId': os.environ.get('DINGTALK_AGENTID', ''),
+        }
+
     # 支持 dingtalk-connector 配置
     if account_id == 'connector':
         dingtalk_connector = channels.get('dingtalk-connector', {})
-        if not dingtalk_connector.get('enabled', False):
-            raise ValueError("dingtalk-connector 未启用")
 
         client_id = resolve_env(dingtalk_connector.get('clientId', ''))
         return {
@@ -196,6 +243,18 @@ def get_dingtalk_config(openclaw_config, account_id='prd_bot'):
             'robotCode': resolve_env(dingtalk_connector.get('robotCode', client_id)),
             'corpId': '',
             'agentId': '',
+        }
+
+    # dingtalk-connector.accounts 配置
+    connector_accounts = channels.get('dingtalk-connector', {}).get('accounts', {})
+    if account_id in connector_accounts:
+        account = connector_accounts[account_id]
+        return {
+            'clientId': resolve_env(account.get('clientId', '')),
+            'clientSecret': resolve_env(account.get('clientSecret', '')),
+            'robotCode': resolve_env(account.get('robotCode', account.get('clientId', ''))),
+            'corpId': resolve_env(account.get('corpId', '')),
+            'agentId': resolve_env(account.get('agentId', '')),
         }
 
     # 传统 dingtalk.accounts 配置
@@ -365,7 +424,12 @@ def detect_media_type(file_path):
         return 'file'
 
 
-def send_media(file_path, target_id, account_id=None, media_type=None, is_group=False, auto_detect_account=True, debug=False, channel_account=None):
+def detect_group_target(target_id):
+    """根据目标 ID 自动判断是否为群聊"""
+    return str(target_id).startswith('cid')
+
+
+def send_media(file_path, target_id, account_id=None, media_type=None, is_group=None, auto_detect_account=True, debug=False, channel_account=None):
     """
     发送媒体文件到钉钉
 
@@ -374,7 +438,7 @@ def send_media(file_path, target_id, account_id=None, media_type=None, is_group=
         target_id: 目标用户 ID 或群 ID
         account_id: OpenClaw 中的钉钉账号 ID（可选，auto_detect_account=True 时自动检测）
         media_type: 媒体类型 (image/voice/video/file)，None 则自动检测
-        is_group: 是否发送到群聊
+        is_group: 是否发送到群聊，None 则根据 target_id 自动检测
         auto_detect_account: 是否自动从 OPENCLAW_AGENT_ID 检测账号
         debug: 是否输出调试信息
         channel_account: 从会话上下文传入的账号（direct runtime 模式使用）
@@ -412,6 +476,13 @@ def send_media(file_path, target_id, account_id=None, media_type=None, is_group=
         if not media_type:
             media_type = detect_media_type(file_path)
 
+        # 自动检测目标类型，允许命令行通过 --group / --user 覆盖
+        if is_group is None:
+            is_group = detect_group_target(target_id)
+
+        if debug:
+            print(f"[DEBUG] 目标类型：{'group' if is_group else 'user'}", file=sys.stderr)
+
         # 获取 access token
         access_token = get_access_token(
             dingtalk_config['clientId'],
@@ -447,6 +518,8 @@ def send_media(file_path, target_id, account_id=None, media_type=None, is_group=
             'file': os.path.basename(file_path),
             'target': target_id,
             'type': media_type,
+            'isGroup': is_group,
+            'targetKind': 'group' if is_group else 'user',
             'account': account_id,
             'accountSource': account_source  # 添加账号来源，便于调试
         }
@@ -461,12 +534,14 @@ def send_media(file_path, target_id, account_id=None, media_type=None, is_group=
 if __name__ == '__main__':
     if len(sys.argv) < 3:
         print(json.dumps({
-            'error': '用法：python send_media.py <文件路径> <目标 ID> [账号 ID] [媒体类型]',
-            'example': 'python send_media.py /path/to/file.pdf 300523656829570034 prd_bot file',
-            'note': '账号 ID 可选，如果省略则从 OPENCLAW_AGENT_ID 自动检测',
+            'error': '用法：python send_media.py <文件路径> <目标 ID> [账号 ID] [媒体类型] [--group|--user] [--debug]',
+            'example': 'python send_media.py /path/to/file.pdf 300523656829570034 prd_bot file --user',
+            'note': '默认会根据目标 ID 自动判断：cid 开头视为群聊；可用 --group / --user 显式覆盖',
             'env': {
                 'OPENCLAW_AGENT_ID': '当前 Agent ID（用于自动检测账号）',
-                'OPENCLAW_ACCOUNT_ID': '直接指定钉钉账号 ID（优先级最高）'
+                'OPENCLAW_ACCOUNT_ID': '直接指定钉钉账号 ID（优先级最高）',
+                'DINGTALK_CLIENTID': '直接指定 clientId（优先级最高）',
+                'DINGTALK_CLIENTSECRET': '直接指定 clientSecret（优先级最高）'
             }
         }, ensure_ascii=False))
         sys.exit(1)
@@ -477,24 +552,46 @@ if __name__ == '__main__':
     # 解析可选参数
     account_id = None
     media_type = None
-    debug = '--debug' in sys.argv or '-d' in sys.argv
+    debug = False
+    is_group = None
+    positionals = []
 
-    if len(sys.argv) > 3:
-        # 第三个参数可能是账号 ID 或媒体类型
-        arg3 = sys.argv[3]
-        if arg3 in ['image', 'voice', 'video', 'file']:
-            media_type = arg3
-        elif arg3 in ['--debug', '-d']:
+    for arg in sys.argv[3:]:
+        if arg in ['--debug', '-d']:
             debug = True
+        elif arg == '--group':
+            is_group = True
+        elif arg == '--user':
+            is_group = False
         else:
-            account_id = arg3
+            positionals.append(arg)
 
-    if len(sys.argv) > 4:
-        arg4 = sys.argv[4]
-        if arg4 in ['image', 'voice', 'video', 'file']:
-            media_type = arg4
-        elif arg4 in ['--debug', '-d']:
-            debug = True
+    if len(positionals) > 0:
+        arg = positionals[0]
+        if arg in ['image', 'voice', 'video', 'file']:
+            media_type = arg
+        else:
+            account_id = arg
+
+    if len(positionals) > 1:
+        arg = positionals[1]
+        if arg in ['image', 'voice', 'video', 'file']:
+            media_type = arg
+        elif account_id is None:
+            account_id = arg
+        else:
+            print(json.dumps({
+                'ok': False,
+                'error': f'无法解析参数：{arg}'
+            }, ensure_ascii=False, indent=2))
+            sys.exit(1)
+
+    if len(positionals) > 2:
+        print(json.dumps({
+            'ok': False,
+            'error': '位置参数过多，请使用：<文件路径> <目标 ID> [账号 ID] [媒体类型] [--group|--user] [--debug]'
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
 
     # 输出调试信息
     if debug:
@@ -502,9 +599,21 @@ if __name__ == '__main__':
         print(f"[DEBUG] 目标：{target_id}", file=sys.stderr)
         print(f"[DEBUG] OPENCLAW_AGENT_ID={os.environ.get('OPENCLAW_AGENT_ID', '未设置')}", file=sys.stderr)
         print(f"[DEBUG] OPENCLAW_ACCOUNT_ID={os.environ.get('OPENCLAW_ACCOUNT_ID', '未设置')}", file=sys.stderr)
+        if is_group is None:
+            print(f"[DEBUG] 目标类型自动检测：{'group' if detect_group_target(target_id) else 'user'}", file=sys.stderr)
+        else:
+            print(f"[DEBUG] 目标类型显式指定：{'group' if is_group else 'user'}", file=sys.stderr)
 
     # 自动检测账号
     auto_detect = account_id is None
 
-    result = send_media(file_path, target_id, account_id, media_type, auto_detect_account=auto_detect, debug=debug)
+    result = send_media(
+        file_path,
+        target_id,
+        account_id,
+        media_type,
+        is_group=is_group,
+        auto_detect_account=auto_detect,
+        debug=debug
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
